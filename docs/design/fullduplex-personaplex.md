@@ -303,6 +303,12 @@ A stalled send cannot cause a catch-up burst. The timeline records send
 schedule lateness so an overloaded client is visible rather than mistaken
 for a faster server. This mode measures steady concurrency, not join/leave
 interference; the original lifecycle mode still checks slot reuse.
+Load mode does not probe an additional N+1 session for `resource_exhausted`;
+the lifecycle mode owns that admission-limit check. A per-session
+`client_pacing_warning` and the summary's `client_pacing_warning_sessions`
+identify send-lateness p99 above one nominal frame (80 ms). This is a warning,
+not an extra acceptance gate: read it alongside server-facing measurements
+so a slow client is not mistaken for a slow server.
 
 The fixed drain window is part of the measurement configuration. Audio
 arriving during cleanup is excluded, so closing cannot rescue a session that
@@ -310,21 +316,27 @@ missed its observation deadline. Cleanup is attempted for admitted sessions
 even when audio validation fails. Protocol errors, missing/invalid audio,
 shared response IDs and cleanup failures make the report fail and the CLI
 exit nonzero. Cancellation closes transports and propagates to the caller.
+`--cleanup-timeout-s` (default 5 s) bounds session-close send and acknowledgement
+together, independently of `--timeout-s`. The subsequent WebSocket close
+handshake has the same separate bound; an unresponsive close acknowledgement
+cannot hold cancellation for the full inference timeout.
 
 `load-result.json` retains per-session send and audio-packet timelines using
 the client's monotonic clock. It does not export handshake credentials or
 raw audio payloads. Metric definitions are explicit:
 
-Load mode validates each nonempty audio packet's strict base64 encoding, PCM16
+Both modes validate each nonempty audio packet's strict base64 encoding, PCM16
 sample alignment, 24 kHz sample rate and response identity. Valid aggregate
-audio cannot hide a malformed packet. Rejected packets make the session fail
+audio cannot hide a malformed packet. In load mode, rejected packets make the session fail
 and appear in `invalid_audio_packets` with their event index, receive time and
 fixed diagnostic code; they do not contribute samples or timing intervals.
 Empty audio deltas remain legal and contribute no samples. This check does
-not change the public client's decoding or the default lifecycle mode.
+not change the public client's decoding. The lifecycle scenario and dispatch
+remain the same, but malformed packets that aggregate checks once tolerated
+now fail that mode as well.
 
 The probe accepts both the current OpenAI Realtime audio event name
-`response.audio.delta` and the legacy `response.output_audio.delta`. Validation
+`response.output_audio.delta` and the legacy `response.audio.delta`. Validation
 uses the wire payload directly rather than relying on a particular client
 library's alias table, so a server-side event-name migration cannot silently
 turn real audio into a zero-output measurement.
@@ -335,7 +347,10 @@ turn real audio into a zero-output measurement.
 | `client_first_audio_after_stream_start_ms` | First audio receipt minus first input send start; admission is excluded. |
 | `client_stream_rtf` | First input send start to last audio receipt, divided by received audio duration. This includes real-time input pacing and is not an inference-only RTF. |
 | `client_send_lateness_ms` | Send start minus its original shared schedule, clipped at zero. |
-| `frame_deficit` | Sent input frames minus received samples divided by 1920. |
+| `frame_deficit` | Integer input-frame minus output-frame count from the shared session validation; missing when valid whole-frame accounting is unavailable. |
+| `output_frames`, `voiced_frames`, `silent_frames`, `frame_coverage_ratio`, `audio_rms`, `audio_chunks` | Session-validation statistics retained on success and on acceptance failure once computed. |
+| `acceptance_check` | Failed local check, with numeric diagnostics in `error`; other exceptions retain phase/type only, without remote handshake or metadata text. |
+| `audio_underrun_s`, `audio_underrun_event_count`, `audio_continuity_ok` | Shared `compute_continuity_stats` on valid PCM16 packet arrivals, with its default 100 ms underrun threshold; absent audio gives missing values rather than a continuity pass. |
 
 No output gives missing latency/RTF values, not zero. By default RTF is
 diagnostic; `--max-client-rtf` adds an explicit ceiling. The existing frame
@@ -348,6 +363,10 @@ warmup path or label that run as cold-start evidence before comparing steady
 capacity. Passing client-only metrics does not certify model quality or a
 real-time capacity target on another GPU. Begin with N=1 and N=2; higher N is a
 capacity experiment, not a promised property of an A100 or of this patch.
+Continuity is a client-arrival diagnostic, not proof of speaker playback and
+not an additional pass/fail gate. Packet-interval and send-lateness summaries
+retain their documented linear p99; the older client interval helper reports
+rounded nearest-rank p95 instead and is not substituted for that schema.
 
 Deterministic driver and localhost WebSocket checks need no model or GPU:
 

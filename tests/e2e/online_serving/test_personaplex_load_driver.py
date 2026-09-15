@@ -48,7 +48,9 @@ def _args(tmp_path, *extra):
             "--drain-s",
             "0.04",
             "--timeout-s",
-            "0.5",
+            "3",
+            "--cleanup-timeout-s",
+            "1",
             "--min-voiced-frames",
             "1",
             "--minimum-audio-chunks",
@@ -119,6 +121,8 @@ async def _server(mode="success"):
                     await ws.send(json.dumps({"type": "response.created", "response": {"id": response_id}}))
                 elif message["type"] == "input_audio_buffer.append":
                     state["frames"] += 1
+                    if mode == "short_audio" and state["frames"] == 2:
+                        continue
                     if mode == "disconnect":
                         await ws.close()
                         return
@@ -126,9 +130,11 @@ async def _server(mode="success"):
                         await ws.send("{")
                     elif mode not in ("silent", "late_on_close"):
                         event_type = (
-                            "response.audio.delta" if mode == "current_audio_event" else "response.output_audio.delta"
+                            "response.audio.delta" if mode == "legacy_audio_event" else "response.output_audio.delta"
                         )
                         packet = _audio(response_id, event_type=event_type)
+                        if mode == "private_metadata":
+                            packet["metadata"] = {"vllm_omni": {"private": "remote-detail-must-not-be-exported"}}
                         if mode == "odd_packet":
                             raw_audio = base64.b64decode(packet["delta"])
                             raw_audio = raw_audio + b"\x00" if state["frames"] == 1 else raw_audio[:-1]
@@ -177,6 +183,8 @@ def test_omitted_sessions_preserves_lifecycle_mode():
         ["--tail-s", "-1"],
         ["--timeout-s", "0"],
         ["--timeout-s", "inf"],
+        ["--cleanup-timeout-s", "0"],
+        ["--cleanup-timeout-s", "nan"],
         ["--max-client-rtf", "-1"],
         ["--max-frame-deficit", "-1"],
         ["--minimum-audio-chunks", "0"],
@@ -206,6 +214,11 @@ def test_metric_clock_and_packet_frame_distinction():
     assert intervals["argmax_index"] == 1
     assert report["client_first_audio_after_stream_start_ms"] == pytest.approx(400)
     assert report["output_samples"] == 15 * driver.FRAME_SAMPLES
+    assert report["audio_underrun_s"] == pytest.approx(0.4)
+    assert report["audio_continuity_ok"] is False
+    underruns = report["audio_underrun_event_count"]
+    assert isinstance(underruns, int) and underruns >= 1
+    assert report["client_pacing_warning"] is False
     assert "secret" not in json.dumps(report)
     assert "-999" not in json.dumps(report)
 
@@ -213,9 +226,26 @@ def test_metric_clock_and_packet_frame_distinction():
 def test_empty_output_has_missing_not_zero_latency():
     report = driver._load_metrics(driver.RawRealtimeProbe("ws://unused"), [])
     assert report["client_stream_rtf"] is None
+    assert report["audio_continuity_ok"] is None
+    assert report["audio_underrun_s"] is None
     intervals = report["client_audio_packet_interval_ms"]
     assert isinstance(intervals, dict)
     assert intervals["p99"] is None
+
+
+def test_failed_acceptance_retains_frame_counts_without_remote_data():
+    client = driver.RawRealtimeProbe("ws://unused")
+    client.events.add(_audio(), received_at_s=1.0)
+    args = driver.parse_args(
+        ["--model", "unused", "--input-wav", "unused.wav", "--max-frame-deficit", "0", "--min-voiced-frames", "1"]
+    )
+    with pytest.raises(AssertionError) as raised:
+        driver._session_result(client, input_frames=2, args=args, minimum_chunks=1)
+    assert getattr(raised.value, "check", None) == "frame_deficit"
+    stats = getattr(raised.value, "stats", {})
+    assert stats["frame_deficit"] == 1 and type(stats["frame_deficit"]) is int
+    assert stats["output_frames"] == stats["voiced_frames"] == 1
+    assert stats["frame_coverage_ratio"] == 0.5
 
 
 @pytest.mark.parametrize("event_type", sorted(driver.AUDIO_DELTA_EVENT_TYPES))
@@ -233,7 +263,7 @@ def test_session_result_accepts_current_and_legacy_audio_event_names(tmp_path, e
     assert stats["frame_deficit"] == 0
 
 
-def test_current_audio_event_name_contributes_load_metrics():
+def test_legacy_audio_event_name_contributes_load_metrics():
     client = driver.RawRealtimeProbe("ws://unused")
     client.events.add(_audio(samples=driver.FRAME_SAMPLES * 5, event_type="response.audio.delta"), received_at_s=10.4)
     report = driver._load_metrics(client, [(10.0, 10.0, 10.01)])
@@ -255,6 +285,14 @@ async def test_real_websocket_load_success(tmp_path, sessions):
     assert isinstance(rows, list)
     assert len(rows) == sessions
     assert all(row["frame_deficit"] == 0 for row in rows)
+    for row in rows:
+        assert type(row["frame_deficit"]) is int
+        assert row["output_frames"] == row["voiced_frames"] == row["audio_chunks"] == 2
+        assert row["silent_frames"] == 0
+        assert row["frame_coverage_ratio"] == 1.0
+        assert row["audio_rms"] == pytest.approx(2000 / 32768)
+        assert row["acceptance_check"] is None
+        assert isinstance(row["audio_continuity_ok"], bool)
     assert all(s["closed"] and s["close_requested"] for s in states)
     assert "must-not-be-exported" not in json.dumps(result)
     saved = json.loads((tmp_path / "out/load-result.json").read_text())
@@ -264,9 +302,9 @@ async def test_real_websocket_load_success(tmp_path, sessions):
 
 
 @pytest.mark.asyncio
-async def test_real_websocket_load_accepts_current_audio_event_name(tmp_path):
+async def test_real_websocket_load_accepts_legacy_audio_event_name(tmp_path):
     args = _args(tmp_path, "--sessions", "2")
-    async with _server("current_audio_event") as (url, states):
+    async with _server("legacy_audio_event") as (url, states):
         args.url = url
         result = await driver.run(args)
     assert result["ok"] is True
@@ -329,9 +367,10 @@ async def test_existing_report_is_not_overwritten(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cancellation_closes_all_connections(tmp_path):
-    args = _args(tmp_path, "--drain-s", "10")
-    async with _server() as (url, states):
+@pytest.mark.parametrize("mode", ["success", "no_close_ack"])
+async def test_cancellation_closes_all_connections(tmp_path, mode):
+    args = _args(tmp_path, "--drain-s", "10", "--timeout-s", "30")
+    async with _server(mode) as (url, states):
         args.url = url
         task = asyncio.create_task(driver.run(args))
 
@@ -359,7 +398,7 @@ async def test_client_rtf_ceiling_marks_slow_sessions_failed(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stalled_send_does_not_cause_catchup_burst(monkeypatch):
+async def test_stalled_send_does_not_cause_catchup_burst():
     class Clock:
         now = 10.0
 
@@ -375,9 +414,6 @@ async def test_stalled_send_does_not_cause_catchup_burst(monkeypatch):
                 clock.now += 0.25
 
     clock = Clock()
-    monkeypatch.setattr(driver, "time", clock)
-    monkeypatch.setattr(driver.asyncio, "sleep", clock.sleep)
-    monkeypatch.setattr(driver, "_check_load_connection", lambda _: None)
     sends: list[tuple[float, float, float]] = []
     await driver._paced_load_frames(
         Client("ws://unused"),
@@ -385,11 +421,51 @@ async def test_stalled_send_does_not_cause_catchup_burst(monkeypatch):
         epoch=10.0,
         timeout_s=1.0,
         sends=sends,
+        clock=clock.monotonic,
+        sleep=clock.sleep,
     )
     assert len(sends) == 3
     assert sends[1][1] >= sends[0][2] + driver.FRAME_PERIOD_S
     assert sends[1][1] - sends[1][0] == pytest.approx(0.25)
     assert sends[2][1] >= sends[1][2] + driver.FRAME_PERIOD_S
+    metrics = driver._load_metrics(Client("ws://unused"), sends)
+    assert metrics["client_pacing_warning"] is True
+    assert asyncio.sleep != clock.sleep
+
+
+@pytest.mark.asyncio
+async def test_failed_frame_acceptance_preserves_numeric_diagnostics(tmp_path):
+    args = _args(tmp_path, "--sessions", "1")
+    async with _server("short_audio") as (url, states):
+        args.url = url
+        result = await driver.run(args)
+    rows = result["sessions"]
+    assert isinstance(rows, list)
+    row = rows[0]
+    assert row["ok"] is False
+    assert row["acceptance_check"] == "frame_deficit"
+    assert row["frame_deficit"] == 1 and type(row["frame_deficit"]) is int
+    assert row["output_frames"] == row["voiced_frames"] == row["audio_chunks"] == 1
+    assert row["frame_coverage_ratio"] == 0.5
+    assert row["audio_rms"] == pytest.approx(2000 / 32768)
+    assert "input=2" in row["error"] and "maximum_deficit=0" in row["error"]
+    assert all(state["closed"] and state["close_requested"] for state in states)
+    assert json.loads((tmp_path / "out/load-result.json").read_text()) == result
+
+
+@pytest.mark.asyncio
+async def test_acceptance_failure_does_not_export_remote_metadata(tmp_path):
+    args = _args(tmp_path, "--sessions", "1")
+    async with _server("private_metadata") as (url, _):
+        args.url = url
+        result = await driver.run(args)
+    rows = result["sessions"]
+    assert isinstance(rows, list)
+    row = rows[0]
+    assert row["ok"] is False
+    assert row["acceptance_check"] == "scheduler_data_plane"
+    assert "remote-detail" not in json.dumps(result)
+    assert "must-not-be-exported" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("ok", [True, False])
