@@ -43,10 +43,11 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
             model_name = served
         else:
             model_name = args.model
-        adapter = getattr(getattr(app.state, "openai_serving_duplex", None), "_serving_runtime_adapter", None)
-        frame_samples = int(getattr(adapter, "silence_continuation_samples", 16000))
+        # One silence unit as the engine-side plugin defines it (DuplexOmniEngine.plugin).
+        plugin = getattr(getattr(app.state.engine_client, "engine", None), "plugin", None)
+        frame_samples = int(getattr(plugin, "silence_continuation_samples", 16000))
         silence = base64.b64encode(bytes(frame_samples * 4)).decode("ascii")
-        from vllm_omni.experimental.fullduplex.client import build_realtime_url
+        from vllm_omni.clients.duplex import build_realtime_url
 
         url = (
             build_realtime_url(f"ws://127.0.0.1:{args.port}/v1/realtime", model_name, autostart=False)
@@ -108,7 +109,7 @@ async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
                 sent += 1
                 await asyncio.sleep(0.08)
             # Wait for the pipeline's first audio output so every stage ran.
-            saw_audio = await _recv_until(lambda e: e.get("type") == "response.audio.delta", 30)
+            saw_audio = await _recv_until(lambda e: e.get("type") == "response.output_audio.delta", 30)
             # Close the session EXPLICITLY: a bare websocket close parks the
             # session in its disconnect grace window, where it would keep
             # occupying the max_sessions=1 slot and block the first client.
