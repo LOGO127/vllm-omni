@@ -25,6 +25,24 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 OVERFLOW = "The decoder prompt (length 93016) is longer than the maximum model length of 65536"
 
 
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_frame_extraction_preserves_pyav_error_handling(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    """A failed PyAV frame must not discard later decodable timestamps."""
+    calls: list[float] = []
+
+    def extract(_path: str | Path, timestamp: float) -> bytes:
+        calls.append(timestamp)
+        if timestamp == 0.0:
+            raise error_type("invalid video frame")
+        return b"\xff\xd8decoded-jpeg"
+
+    monkeypatch.setattr(eval_mod, "extract_jpeg", extract)
+    assert eval_mod._extract_frames(Path("fixture.mp4"), [0.0, 1.0]) == [b"\xff\xd8decoded-jpeg"]
+    assert calls == [0.0, 1.0]
+
+
 def _http_error(status: int, body: str) -> requests.HTTPError:
     response = requests.Response()
     response.status_code = status
